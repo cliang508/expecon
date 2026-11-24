@@ -1,0 +1,219 @@
+---
+title: "expecon"
+format: html
+editor: visual
+---
+
+# Experimental Economics Project - Data Analysis
+
+Mira Choi, Carrie Liang, Mehak Rawal
+
+## Setup
+
+```{r}
+# Load libraries
+library(tidyverse)
+
+# Import data
+raw <- read_csv("C:/Users/liang/OneDrive/Bureau/TSE/Experimental Economics/responses.csv", col_names = FALSE, col_types = cols(.default = "c"))
+
+# Custom colors from nationalparkcolors (installation requires devtools): https://github.com/katiejolly/nationalparkcolors
+library(nationalparkcolors)
+palette <- park_palette("ArcticGates")
+```
+
+```{r}
+# Clean data
+
+# Fix table names
+hdr <- raw[1:3, ] |> t() |> as_tibble(.name_repair = "minimal")
+names(hdr) <- c("l1", "l2", "l3")
+
+hdr <- hdr |> fill(l1, l2, .direction = "down")   # l3 is not filled
+
+new_names <- if_else(
+  is.na(hdr$l3),
+  paste(hdr$l1, hdr$l2, sep = "_"),               # boredom_pleasance, devices_how long
+  paste(hdr$l1, hdr$l2, hdr$l3, sep = "_")        # boredom_10€_1
+) |> str_remove_all(" ")                          # "how long" -> "howlong"
+
+new_names[1] <- "id"
+
+df <- raw[-(1:3), ]
+names(df) <- new_names
+
+# Use renamed df to tidy data by pivot_longer
+main <- df |>
+  select(id, matches("^(boredom|devices)_\\d+€_\\d+$")) |>
+  pivot_longer(
+    cols = -id,
+    names_to = c("task", "amount", "level"),
+    names_sep = "_",
+    values_to = "response"
+  )
+
+extras <- df |>
+  select(id, ends_with("_pleasance"), ends_with("_howlong")) |>
+  pivot_longer(
+    cols = -id,
+    names_to = c("task", ".value"),
+    names_sep = "_"
+  )
+
+df_long <- main |>
+  left_join(extras, by = c("id", "task")) |>
+  mutate(across(c(amount, level, response, pleasance, howlong), parse_number))
+
+# Ensure correct data types
+df_long <- df_long |>
+  mutate(
+    response = as.numeric(response),                   # 0/1
+    amount   = parse_number(as.character(amount)),     # 10, 20
+    level    = parse_number(as.character(level))       # 1, 5, 9
+  )
+```
+
+## Hypothesis 1: More people will pay to leave under the "boredom" condition
+
+Each person has 6 scenarios following the "boredom" condition and 6 scenarios following the "devices" condition. Their aggregated "score" is the yes-rate out of the 6 for each of the "boredom" and "devices" condition.
+
+The null hypothesis is that people will pay the same under both conditions, or less under the "boredom" condition. The alternative hypothesis is that more people will pay to leave under the "boredom" condition.
+
+We do paired t-tests throughout this report because samples are linked by participant in our within-subject design, and we assume participants are choosing independently, and these differences are normally distributed.
+
+```{r}
+# Hypothesis 1
+per_task <- df_long |>
+  group_by(id, task) |>
+  summarise(prop_yes = mean(response, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = task, values_from = prop_yes)
+
+t.test(per_task$boredom, per_task$devices, paired = TRUE, alternative = "greater")    # greater: test that boredom > devices
+
+# Suggested robustness check
+wilcox.test(per_task$boredom, per_task$devices, paired = TRUE, alternative = "greater")
+```
+
+Results: mean difference = 0.219, 95% CI is (0.069, inf) (for per-person boredom minus devices). p-value is \< 0.05, can conclude significance.
+
+## Hypothesis 2: The higher cost to leave, the less people will pay to leave
+
+Two alternative ways of testing this: only compare cost 1 vs cost 9, or calculate slope of regression of proportion of "yes" on cost (this way, all three cost levels are factored in). We do one-sided t-tests, expecting fewer people to choose "yes" to leave as costs increase.
+
+```{r}
+# Hypothesis 2
+per_level <- df_long |>
+  group_by(id, level) |>
+  summarise(prop_yes = mean(response, na.rm = TRUE), .groups = "drop")
+
+# (a) only compares level 1 vs level 9
+lv <- per_level |>
+  filter(level %in% c(1, 9)) |>
+  pivot_wider(names_from = level, values_from = prop_yes, names_prefix = "level")
+
+t.test(lv$level9, lv$level1, paired = TRUE, alternative = "less")   # expects fewer "yes to leave" at cost 9
+
+# (b) per-person slope across all three levels
+slopes <- per_level |>
+  group_by(id) |>
+  summarise(slope = coef(lm(prop_yes ~ level))[2])
+
+t.test(slopes$slope, mu = 0, alternative = "less")
+```
+
+Both tests turn out to yield significant results with p-values \< 0.05. For the second option, mean slope is -0.048 and 95% CI is (-Inf, -0.03). This is expected, negative slope means that increase in cost is correlated with reduction in proportion of "yes".
+
+## Hypothesis 3: The higher the budget, the more people pay to leave
+
+This hypothesis is because we expect that if people have more means, they would be able to afford a more expensive option to save more of their time. This is a similar idea as 1, but we now calculate proportions out of 6 conditions for 10 euros vs. 20 euros budget.
+
+```{r}
+per_amount <- df_long |>
+  group_by(id, amount) |>
+  summarise(prop_yes = mean(response, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = amount, values_from = prop_yes, names_prefix = "eur")
+
+t.test(per_amount$eur20, per_amount$eur10, paired = TRUE, alternative = "greater")
+
+# Suggested robustness check
+wilcox.test(per_amount$eur20, per_amount$eur10, paired = TRUE, alternative = "greater")
+```
+
+No significant results this time around, we cannot conclude that more budget leads to higher proportion of "yes to leave". In fact, when looking at the results manually, we noticed something interesting: some participants responded with lower rates of "yes" for the 20 euro budget condition.
+
+## Plotting: Unexpected results for Hypothesis 3
+
+```{r}
+diffs <- per_amount |>
+  mutate(diff = eur20 - eur10) |>
+  arrange(diff) |>
+  mutate(rank = row_number(),
+         direction = if_else(diff < 0, "Negative", "Zero or positive"))
+
+mean_diff <- mean(diffs$diff, na.rm = TRUE)
+
+hyp3_plot <- ggplot(diffs, aes(x = rank, y = diff, fill = direction)) +
+  geom_col() +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = mean_diff, linetype = "dashed", colour = palette[6]) +
+  annotate("text",
+           x = 1, y = mean_diff,
+           label = paste0("Mean difference = ", round(mean_diff, 2)),
+           colour = palette[6], size = 3.5,
+           hjust = 0, vjust = -0.6) +
+  scale_fill_manual(values = c("Negative" = palette[4],
+                               "Zero or positive" = palette[3])) +
+  scale_y_continuous(
+    breaks = seq(-1, 1, by = 1/6),
+    labels = c("-1", "-5/6", "-2/3", "-1/2", "-1/3", "-1/6", "0",
+               "1/6", "1/3", "1/2", "2/3", "5/6", "1")
+  ) +
+  scale_x_continuous(breaks = NULL) +
+  labs(x = "Participants (sorted by difference)",
+       y = "Yes-rate difference (20€ − 10€)",
+       title = "Per-participant effect of budget (n=19)",
+       fill = NULL) +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+hyp3_plot
+```
+
+## Plotting: Main figure that shows everything
+
+```{r}
+cell_df <- df_long |>
+  mutate(level = as.numeric(as.character(level))) |>
+  group_by(task, amount, level) |>
+  summarise(
+    p  = mean(response, na.rm = TRUE),
+    n  = sum(!is.na(response)),
+    se = sqrt(p * (1 - p) / n),
+    .groups = "drop"
+  )
+
+amount_labels <- c("10" = "Budget: 10€",
+                   "20" = "Budget: 20€")
+
+all_plot <- ggplot(cell_df, aes(x = level, y = p, colour = task)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = p - se, ymax = p + se), width = 0.3) +
+  facet_wrap(~ amount, labeller = as_labeller(amount_labels)) +
+  scale_x_continuous(breaks = c(1, 5, 9)) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 1/6),
+    labels = c("0", "1/6", "1/3", "1/2", "2/3", "5/6", "1")
+  ) +
+  labs(x = "Cost (€)", 
+       y = "Proportion answering yes", 
+       colour = "Condition",
+       title = "Participant responses to budget, leaving cost, and boredom conditions (n=19)") +
+  scale_colour_manual(values = c(palette[2], palette[5])) +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank())
+
+all_plot
+```
